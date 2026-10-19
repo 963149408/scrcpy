@@ -304,12 +304,7 @@ public final class VirtualDisplayRegistry {
                     vd.resize(width, height, dpi);
                     Ln.i("VirtualDisplayRegistry: resized virtual display id=" + displayId + " to " + width + "x" + height
                             + "/" + dpi + " (external surface, reader untouched)");
-                    // Re-freeze rotation after resize to ensure orientation stays isolated.
-                    try {
-                        ServiceManager.getWindowManager().freezeRotation(displayId, Surface.ROTATION_0);
-                    } catch (Throwable ignore) {
-                        Ln.w("VirtualDisplayRegistry: freezeRotation failed (best-effort) for displayId=" + displayId, ignore);
-                    }
+                    releaseRotationLockAfterResize(displayId);
                     return true;
                 }
 
@@ -318,11 +313,7 @@ public final class VirtualDisplayRegistry {
                     vd.resize(width, height, dpi);
                     Ln.i("VirtualDisplayRegistry: resized virtual display id=" + displayId + " to " + width + "x" + height
                             + "/" + dpi + " (no reader)");
-                    try {
-                        ServiceManager.getWindowManager().freezeRotation(displayId, Surface.ROTATION_0);
-                    } catch (Throwable ignore) {
-                        Ln.w("VirtualDisplayRegistry: freezeRotation failed (best-effort) for displayId=" + displayId, ignore);
-                    }
+                    releaseRotationLockAfterResize(displayId);
                     return true;
                 }
 
@@ -348,12 +339,7 @@ public final class VirtualDisplayRegistry {
 
                     vd.setSurface(newReader.getSurface());
                     vd.resize(width, height, dpi);
-                    // Re-freeze rotation to keep virtual display orientation isolated
-                    try {
-                        ServiceManager.getWindowManager().freezeRotation(displayId, Surface.ROTATION_0);
-                    } catch (Throwable ignore) {
-                        Ln.w("VirtualDisplayRegistry: freezeRotation failed (best-effort) for displayId=" + displayId, ignore);
-                    }
+                    releaseRotationLockAfterResize(displayId);
                 } catch (Exception e) {
                     try {
                         newReader.close();
@@ -459,6 +445,28 @@ public final class VirtualDisplayRegistry {
      * <p>This is a daemon-side workaround; it does not modify upstream
      * {@link com.genymobile.scrcpy.wrappers.WindowManager}.
      */
+    /**
+     * 调整尺寸后释放方向锁，而不是把虚拟显示重新钉在 ROTATION_0。
+     *
+     * <p>原实现在每次 resize 后都调用 {@code freezeRotation(displayId, ROTATION_0)}。
+     * 方向一旦被钉死，横屏应用（声明了 {@code screenOrientation="landscape"} 的游戏、
+     * 播放器等）就无法把虚拟屏转过去，WindowManager 只能把它塞进竖屏显示里做
+     * letterbox / 裁剪，投屏端看到的就是「画面被截断」。
+     *
+     * <p>改为 thaw：让应用自己决定方向，编码器会通过 {@code DisplayMonitor} 感知
+     * rotation 变化后按新的逻辑尺寸重建。
+     */
+    private void releaseRotationLockAfterResize(int displayId) {
+        try {
+            ServiceManager.getWindowManager().thawRotation(displayId);
+            Ln.i("VirtualDisplayRegistry: released rotation lock for displayId=" + displayId
+                    + " after resize (landscape apps must be able to rotate the display)");
+        } catch (Throwable t) {
+            Ln.d("VirtualDisplayRegistry: thawRotation after resize failed (best-effort) for displayId="
+                    + displayId + ": " + t.getMessage());
+        }
+    }
+
     private void freezeRotationWithRetry(int displayId, int rotation) {
         com.genymobile.scrcpy.wrappers.WindowManager wm = ServiceManager.getWindowManager();
         for (int attempt = 1; attempt <= 5; attempt++) {

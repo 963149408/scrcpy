@@ -19,10 +19,13 @@ import android.view.Surface;
  * display (id 0) is always allowed; other ids must refer to a daemon-managed
  * virtual display.
  *
- * <p>Note: {@link VirtualDisplayRegistry} already freezes each virtual display
- * to {@link Surface#ROTATION_0} on create/resize and thaws on release. A client
- * freeze/thaw therefore composes with that internal policy; a subsequent resize
- * will re-freeze to ROTATION_0, overriding a client-requested orientation.
+ * <p>Note: {@link VirtualDisplayRegistry} used to freeze every virtual display to
+ * {@link Surface#ROTATION_0} on create/resize and thaw on release. It no longer
+ * does so on resize: pinning the rotation made landscape-only apps unrotatable,
+ * which cropped their picture on the viewing side. The registry now only
+ * <em>thaws</em> after a resize, so the app itself may rotate the display; the
+ * encoder follows via its DisplayMonitor. An explicit client freeze() still wins,
+ * but any later resize releases it again.
  */
 public final class RotationController {
 
