@@ -97,18 +97,22 @@ public final class ClientSession implements Runnable, SessionConfigurator {
     @Override
     public void run() {
         Ln.i("Session[" + sessionId + "]: starting negotiation loop (phase=INIT)");
+        Ln.i("CONN session[" + sessionId + "]: negotiation loop start, phase=INIT");
         String deviceName = Device.getDeviceName();
         try {
             connection.sendDeviceMeta(deviceName);
             Ln.i("Session[" + sessionId + "]: device meta sent via negotiation channel");
+            Ln.i("CONN session[" + sessionId + "]: device meta sent name=" + deviceName);
         } catch (IOException e) {
             Ln.w("Session[" + sessionId + "]: failed to send device meta: " + e.getMessage());
+            Ln.w("CONN session[" + sessionId + "]: device meta send FAILED — " + e.getMessage());
         }
 
         DeviceMessageSender negotiationSender = null;
         try {
             negotiationSender = new DeviceMessageSender(connection.getNegotiationChannel());
             negotiationSender.start();
+            Ln.i("CONN session[" + sessionId + "]: negotiation sender started, awaiting messages");
 
             negotiationCommandHandler = new DaemonCommandHandler(
                     negotiationSender, null, registry, exitCoordinator, null, this, broadcasterRegistry, sessionId);
@@ -128,16 +132,22 @@ public final class ClientSession implements Runnable, SessionConfigurator {
                     continue;
                 }
                 if (msg == null) {
+                    Ln.i("CONN session[" + sessionId + "]: negotiation channel EOF (peer closed), exiting loop");
                     break;
                 }
+                Ln.i("CONN session[" + sessionId + "]: recv negotiation msg seq=" + msg.getSequence()
+                        + " type=" + msg.getType() + " phase=" + phaseName(phase));
                 boolean handled = negotiationCommandHandler.handle(msg);
                 if (!handled) {
                     Ln.w("Session[" + sessionId + "]: unhandled message type in negotiation: " + msg.getType());
+                    Ln.w("CONN session[" + sessionId + "]: unhandled negotiation msg type=" + msg.getType());
                 }
             }
         } catch (Throwable t) {
             if (!exited.get()) {
                 Ln.e("Session[" + sessionId + "]: error in negotiation loop", t);
+                Ln.e("CONN session[" + sessionId + "]: negotiation loop ERROR — "
+                        + t.getClass().getSimpleName() + ": " + t.getMessage(), t);
             }
         } finally {
             if (negotiationSender != null) {
@@ -153,6 +163,8 @@ public final class ClientSession implements Runnable, SessionConfigurator {
             }
             cleanup();
             Ln.i("Session[" + sessionId + "]: closed");
+            Ln.i("CONN session[" + sessionId + "]: CLOSED (exitRequested="
+                    + exitCoordinator.isExitRequested() + ")");
             if (exitCoordinator.isExitRequested()) {
                 Ln.i("Session[" + sessionId + "]: Exit coordinator requested shutdown, exiting.");
             }
@@ -217,6 +229,9 @@ public final class ClientSession implements Runnable, SessionConfigurator {
                 + ", rolesMask=0b" + Integer.toBinaryString(this.declaredRolesMask)
                 + ", rolesEntries=" + this.declaredRoleKeys.size()
                 + ", " + Math.max(0, merged.length - 1) + " option keys");
+        Ln.i("CONN session[" + sessionId + "]: CONFIGURE_SESSION OK -> phase=CONFIGURED"
+                + " declaredRoles=" + this.declaredRoleKeys
+                + " optionsKv=[" + (optionsKv != null ? optionsKv : "") + "]");
     }
 
     // -----------------------------------------------------------------------
@@ -241,6 +256,9 @@ public final class ClientSession implements Runnable, SessionConfigurator {
         if (phase != PHASE_CONFIGURED) {
             Ln.w("Session[" + sessionId + "]: rejecting role socket — phase="
                     + phaseName(phase) + " (must complete CONFIGURE_SESSION first)");
+            Ln.w("CONN session[" + sessionId + "]: role socket REJECTED role=" + role
+                    + " displayId=" + displayId + " — phase=" + phaseName(phase)
+                    + ", CONFIGURE_SESSION not completed yet");
             return false;
         }
         Set<TcpDesktopConnection.RoleDisplayKey> keys = declaredRoleKeys;
@@ -250,6 +268,8 @@ public final class ClientSession implements Runnable, SessionConfigurator {
                 Ln.w("Session[" + sessionId + "]: rejecting role socket "
                         + new TcpDesktopConnection.RoleDisplayKey(role, displayId)
                         + " — not declared in CONFIGURE_SESSION rolesEntries");
+                Ln.w("CONN session[" + sessionId + "]: role socket REJECTED role=" + role
+                        + " displayId=" + displayId + " — not declared, declared=" + keys);
                 return false;
             }
             return true;
@@ -260,6 +280,9 @@ public final class ClientSession implements Runnable, SessionConfigurator {
             Ln.w("Session[" + sessionId + "]: rejecting role socket bit 0b"
                     + Integer.toBinaryString(bit) + " — not declared in CONFIGURE_SESSION (mask=0b"
                     + Integer.toBinaryString(declaredRolesMask) + ")");
+            Ln.w("CONN session[" + sessionId + "]: role socket REJECTED role=" + role
+                    + " displayId=" + displayId + " — role bit not in mask=0b"
+                    + Integer.toBinaryString(declaredRolesMask));
             return false;
         }
         return true;
@@ -280,16 +303,22 @@ public final class ClientSession implements Runnable, SessionConfigurator {
 
     public void onControlSocket(int displayId, Socket socket) {
         if (exited.get() || !acceptRoleSocket(TcpDesktopConnection.ROLE_CONTROL, displayId)) {
+            if (exited.get()) {
+                Ln.w("CONN session[" + sessionId + "]: control socket REJECTED displayId=" + displayId
+                        + " — session already exited");
+            }
             try { socket.close(); } catch (IOException ignored) {}
             return;
         }
         try {
             // Acknowledge: server sends the displayId back so client can confirm routing.
             TcpDesktopConnection.writeDisplayId(socket, displayId);
+            Ln.i("CONN session[" + sessionId + "]: control socket ack displayId=" + displayId + " sent");
 
             com.genymobile.scrcpy.control.ControlChannel ch = connection.bindControlSocket(displayId, socket);
             Ln.i("Session[" + sessionId + "]: control socket bound for displayId=" + displayId
                     + ", launching scrcpy controller");
+            Ln.i("CONN session[" + sessionId + "]: control channel bound displayId=" + displayId);
 
             Controller controller;
             synchronized (controllers) {
@@ -347,16 +376,31 @@ public final class ClientSession implements Runnable, SessionConfigurator {
             runner.start(controller, fatalError -> {
                 Ln.i("Session[" + sessionId + "]: scrcpy controller terminated for displayId="
                         + displayId + ", fatal=" + fatalError);
+                Ln.i("CONN session[" + sessionId + "]: control loop ended displayId=" + displayId
+                        + " fatal=" + fatalError);
                 finalCtrl.stop();
             });
+            Ln.i("CONN session[" + sessionId + "]: control loop runner started displayId=" + displayId
+                    + " mirrorId=" + resolveMirrorId(registry, displayId));
         } catch (Throwable t) {
             Ln.e("Session[" + sessionId + "]: failed to initialize scrcpy controller displayId=" + displayId, t);
+            Ln.e("CONN session[" + sessionId + "]: control socket setup FAILED displayId=" + displayId
+                    + " — " + t.getClass().getSimpleName() + ": " + t.getMessage(), t);
             try { socket.close(); } catch (IOException ignored) {}
         }
     }
 
+    private static int resolveMirrorId(VirtualDisplayRegistry registry, int displayId) {
+        com.genymobile.scrcpy.daemon.display.VirtualDisplaySession vd = registry.getSession(displayId);
+        return vd != null ? vd.getMirrorDisplayId() : -1;
+    }
+
     public void onVideoSocket(int displayId, Socket socket) {
         if (exited.get() || !acceptRoleSocket(TcpDesktopConnection.ROLE_VIDEO, displayId)) {
+            if (exited.get()) {
+                Ln.w("CONN session[" + sessionId + "]: video socket REJECTED displayId=" + displayId
+                        + " — session already exited");
+            }
             try { socket.close(); } catch (IOException ignored) {}
             return;
         }
@@ -382,22 +426,32 @@ public final class ClientSession implements Runnable, SessionConfigurator {
             TcpDesktopConnection.writeDisplayId(socket, displayId);
         } catch (IOException e) {
             Ln.w("Session[" + sessionId + "]: failed to write displayId ack for video socket: " + e.getMessage());
+            Ln.w("CONN session[" + sessionId + "]: video ack FAILED displayId=" + displayId
+                    + " — " + e.getMessage());
             try { socket.close(); } catch (IOException ignored) {}
             return;
         }
         vc.bindVideoSocket(socket);
+        Ln.i("CONN session[" + sessionId + "]: video socket bound displayId=" + displayId
+                + " (encoder starts on demand)");
     }
 
     public void onAudioSocket(int displayId, Socket socket) {
         if (exited.get() || !acceptRoleSocket(TcpDesktopConnection.ROLE_AUDIO, displayId)) {
+            if (exited.get()) {
+                Ln.w("CONN session[" + sessionId + "]: audio socket REJECTED displayId=" + displayId
+                        + " — session already exited");
+            }
             try { socket.close(); } catch (IOException ignored) {}
             return;
         }
         try {
             TcpDesktopConnection.writeDisplayId(socket, displayId);
             connection.bindAudioSocket(displayId, socket);
+            Ln.i("CONN session[" + sessionId + "]: audio socket bound displayId=" + displayId);
         } catch (IOException e) {
             Ln.e("Session[" + sessionId + "]: failed to bind audio socket displayId=" + displayId, e);
+            Ln.e("CONN session[" + sessionId + "]: audio socket bind FAILED displayId=" + displayId, e);
         }
     }
 
@@ -443,6 +497,8 @@ public final class ClientSession implements Runnable, SessionConfigurator {
                 phase = PHASE_CLOSED;
             }
         }
+        Ln.i("CONN session[" + sessionId + "]: cleanup begin (videoControllers=" + videoControllers.size()
+                + ", controllers=" + controllers.size() + ")");
 
         // Step 3: release all VD references held by this session.
         registry.releaseSession(sessionId);

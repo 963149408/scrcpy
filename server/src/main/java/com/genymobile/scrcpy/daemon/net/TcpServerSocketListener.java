@@ -31,6 +31,8 @@ public final class TcpServerSocketListener {
                 }
             }
             if (allAlive) {
+                Ln.i("CONN listen: already listening on " + serverSockets.size()
+                        + " address(es), reusing existing ServerSocket(s)");
                 return;
             }
         }
@@ -52,29 +54,38 @@ public final class TcpServerSocketListener {
                 ss.bind(new InetSocketAddress(addr, port), 50);
                 serverSockets.add(ss);
                 Ln.i("TcpServerSocketListener: ServerSocket bound to " + addr + ":" + port);
+                Ln.i("CONN listen: ServerSocket bound " + addr + ":" + port
+                        + " (backlog=50, bindCount=" + serverSockets.size() + ")");
 
                 // 启动接收线程
                 Thread thread = new Thread(() -> {
                     while (!closed) {
                         try {
                             Socket s = ss.accept();
+                            Ln.i("CONN listen: accepted raw socket from "
+                                    + s.getRemoteSocketAddress() + " on " + addr + ":" + port);
                             acceptedSockets.put(s);
                         } catch (IOException e) {
                             if (!closed) {
                                 Ln.w("ServerSocket accept failed on " + addr + ": " + e.getMessage());
+                                Ln.w("CONN listen: accept FAILED on " + addr + ":" + port
+                                        + " — " + e.getMessage());
                             }
                             break;
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
+                            Ln.w("CONN listen: accept thread interrupted on " + addr + ":" + port);
                             break;
                         }
                     }
+                    Ln.i("CONN listen: accept thread exiting for " + addr + ":" + port);
                 }, "accept-thread-" + addr);
                 thread.setDaemon(true);
                 thread.start();
                 acceptThreads.add(thread);
             } catch (IOException e) {
                 Ln.e("Failed to bind to " + addr + ":" + port, e);
+                Ln.e("CONN listen: BIND FAILED " + addr + ":" + port + " — " + e.getMessage(), e);
                 if (addressesToBind.size() == 1 || addr.equals(bindAddress)) {
                     throw e; // 主监听地址绑定失败则抛出异常
                 }

@@ -13,7 +13,6 @@ import com.genymobile.scrcpy.util.Ln;
 import java.io.IOException;
 import java.net.Socket;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,6 +32,15 @@ public final class DaemonServer {
      *  within an operational window. */
     private static final int SOCKET_READ_TIMEOUT_MS = 60_000;
 
+    /** How long (ms) an IP stays locked out after a failed authentication.
+     *  Previously the blacklist was permanent for the lifetime of the daemon
+     *  process: a single wrong password (a typo, or a stale password cached on
+     *  the client) locked that peer out forever, and every later attempt was
+     *  accepted then closed instantly — which looks like a random "connects but
+     *  nothing happens" failure. A timed lockout keeps the brute-force defense
+     *  while making the failure recoverable without restarting the server. */
+    private static final long BLACKLIST_TTL_MS = 5 * 60_000L;
+
     private final Options options;
     private final DaemonOptions daemonOptions;
     private final String[] baseArgs;
@@ -47,7 +55,9 @@ public final class DaemonServer {
     private final FrameBroadcasterRegistry broadcasterRegistry;
 
     private final String secretToken;
-    private final Set<String> blacklistedIps = ConcurrentHashMap.newKeySet();
+    /** ip -> epoch millis until which the IP is locked out (expired entries are
+     *  purged lazily, so this map only ever holds currently-active lockouts). */
+    private final Map<String, Long> blacklistedIps = new ConcurrentHashMap<>();
 
     private ExecutorService acceptExecutor;
     private ExecutorService clientExecutor;
@@ -110,6 +120,10 @@ public final class DaemonServer {
         while (running.get()) {
             try {
                 Socket socket = TcpServerSocketListener.acceptNextSocket();
+                long acceptedAt = System.currentTimeMillis();
+                String remote = String.valueOf(socket.getRemoteSocketAddress());
+                Ln.i("CONN accept: socket from " + remote + " (activeSessions=" + sessions.size()
+                        + ", blacklisted=" + blacklistedIps.size() + ")");
                 try {
                     socket.setSoTimeout(SOCKET_READ_TIMEOUT_MS);
                 } catch (Exception ignored) {
@@ -118,8 +132,12 @@ public final class DaemonServer {
                     // defense-in-depth against half-open connections.
                 }
                 String ip = socket.getInetAddress().getHostAddress();
-                if (blacklistedIps.contains(ip)) {
+                long lockRemainingMs = blacklistRemainingMs(ip);
+                if (lockRemainingMs > 0) {
                     Ln.w("Connection rejected from blacklisted IP: " + ip);
+                    Ln.w("CONN reject: blacklisted ip=" + ip + " remote=" + remote
+                            + " — lockout expires in " + (lockRemainingMs / 1000) + "s,"
+                            + " restart the daemon or wait it out");
                     socket.close();
                     continue;
                 }
@@ -128,9 +146,13 @@ public final class DaemonServer {
                     role = TcpDesktopConnection.readSocketRole(socket);
                 } catch (IOException e) {
                     Ln.w("Failed to read socket role: " + e.getMessage());
+                    Ln.w("CONN reject: role read failed from " + remote + " after "
+                            + (System.currentTimeMillis() - acceptedAt) + "ms — " + e.getMessage());
                     socket.close();
                     continue;
                 }
+                Ln.i("CONN role: " + roleName(role) + "(" + role + ") from " + remote
+                        + " handshakeElapsed=" + (System.currentTimeMillis() - acceptedAt) + "ms");
 
                 switch (role) {
                     case TcpDesktopConnection.ROLE_NEGOTIATION:
@@ -147,6 +169,7 @@ public final class DaemonServer {
                         break;
                     default:
                         Ln.w("Unknown socket role: " + role);
+                        Ln.w("CONN reject: unknown role=" + role + " remote=" + remote);
                         socket.close();
                 }
             } catch (IOException e) {
@@ -158,17 +181,62 @@ public final class DaemonServer {
         Ln.i("DaemonServer accept loop exited");
     }
 
+    private static String roleName(int role) {
+        switch (role) {
+            case TcpDesktopConnection.ROLE_VIDEO:
+                return "VIDEO";
+            case TcpDesktopConnection.ROLE_AUDIO:
+                return "AUDIO";
+            case TcpDesktopConnection.ROLE_CONTROL:
+                return "CONTROL";
+            case TcpDesktopConnection.ROLE_NEGOTIATION:
+                return "NEGOTIATION";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    private void blacklist(String ip) {
+        blacklistedIps.put(ip, System.currentTimeMillis() + BLACKLIST_TTL_MS);
+    }
+
+    /**
+     * @return remaining lockout in ms, or 0 (and the entry is purged) if the IP
+     *         is not locked out. Purging lazily keeps the map small without a
+     *         background sweeper thread.
+     */
+    private long blacklistRemainingMs(String ip) {
+        Long until = blacklistedIps.get(ip);
+        if (until == null) {
+            return 0;
+        }
+        long remaining = until - System.currentTimeMillis();
+        if (remaining <= 0) {
+            blacklistedIps.remove(ip, until);
+            Ln.i("CONN blacklist: lockout expired for ip=" + ip + ", accepting again");
+            return 0;
+        }
+        return remaining;
+    }
+
     private void handleNegotiationSocket(Socket socket) {
         // Atomically reserve a session id in [1, Integer.MAX_VALUE]; wrap to 1
         // on overflow. getAndUpdate is atomic, unlike the previous
         // getAndIncrement + non-atomic reset-to-1 which could let two
         // concurrent callers both pick the same (possibly 0 or negative) id.
         int sessionId = nextSessionId.getAndUpdate(prev -> prev >= Integer.MAX_VALUE ? 1 : prev + 1);
+        String remote = String.valueOf(socket.getRemoteSocketAddress());
+        Ln.i("CONN nego: assigned sessionId=" + sessionId + " remote=" + remote
+                + " auth=" + (secretToken != null ? "required" : "none"));
 
         try {
             TcpDesktopConnection.writeSessionId(socket, sessionId);
+            Ln.i("CONN nego: sessionId=" + sessionId + " written to client, waiting for"
+                    + (secretToken != null ? " token verification" : " device meta"));
         } catch (IOException e) {
             Ln.w("Failed to write sessionId: " + e.getMessage());
+            Ln.w("CONN nego: ABORT sessionId=" + sessionId + " remote=" + remote
+                    + " — failed to write sessionId: " + e.getMessage());
             try { socket.close(); } catch (IOException closeEx) {
                 Ln.d("Failed to close negotiation socket after sessionId write failure: " + closeEx.getMessage());
             }
@@ -176,18 +244,29 @@ public final class DaemonServer {
         }
 
         if (secretToken != null) {
+            long authStart = System.currentTimeMillis();
             try {
                 if (!authenticate(socket, secretToken)) {
                     String ip = socket.getInetAddress().getHostAddress();
-                    blacklistedIps.add(ip);
-                    Ln.w("Authentication failed for IP: " + ip + ". IP blacklisted.");
+                    blacklist(ip);
+                    Ln.w("Authentication failed for IP: " + ip + ". IP blacklisted for "
+                            + (BLACKLIST_TTL_MS / 1000) + "s.");
+                    Ln.w("CONN auth: FAILED sessionId=" + sessionId + " ip=" + ip
+                            + " elapsed=" + (System.currentTimeMillis() - authStart) + "ms — ip blacklisted for "
+                            + (BLACKLIST_TTL_MS / 1000) + "s");
                     try { socket.close(); } catch (IOException ignored) {}
                     return;
                 }
+                Ln.i("CONN auth: OK sessionId=" + sessionId + " ip="
+                        + socket.getInetAddress().getHostAddress()
+                        + " elapsed=" + (System.currentTimeMillis() - authStart) + "ms");
             } catch (Exception e) {
                 String ip = socket.getInetAddress().getHostAddress();
-                blacklistedIps.add(ip);
-                Ln.w("Authentication error for IP: " + ip + ". IP blacklisted. Error: " + e.getMessage());
+                blacklist(ip);
+                Ln.w("Authentication error for IP: " + ip + ". IP blacklisted for "
+                        + (BLACKLIST_TTL_MS / 1000) + "s. Error: " + e.getMessage());
+                Ln.w("CONN auth: ERROR sessionId=" + sessionId + " ip=" + ip
+                        + " elapsed=" + (System.currentTimeMillis() - authStart) + "ms — " + e.getMessage());
                 try { socket.close(); } catch (IOException ignored) {}
                 return;
             }
@@ -198,6 +277,8 @@ public final class DaemonServer {
             session = new ClientSession(socket, sessionId, options, baseArgs, registry, surfaceBroker, exitCoordinator, this, broadcasterRegistry);
         } catch (IOException e) {
             Ln.w("Failed to create client session: " + e.getMessage());
+            Ln.w("CONN nego: ABORT sessionId=" + sessionId + " remote=" + remote
+                    + " — ClientSession ctor failed: " + e.getMessage());
             try { socket.close(); } catch (IOException closeEx) {
                 Ln.d("Failed to close negotiation socket after session creation failure: " + closeEx.getMessage());
             }
@@ -206,6 +287,8 @@ public final class DaemonServer {
 
         sessions.put(sessionId, session);
         Ln.i("DaemonServer: new negotiation session " + sessionId + " from " + socket.getRemoteSocketAddress());
+        Ln.i("CONN nego: sessionId=" + sessionId + " registered (activeSessions=" + sessions.size()
+                + "), submitting to client executor");
 
         try {
             clientExecutor.submit(session);
@@ -214,6 +297,7 @@ public final class DaemonServer {
             // shutdown). Remove the map entry and tear down the session so the
             // socket does not leak.
             Ln.w("DaemonServer: rejected session " + sessionId + " (executor shut down?), cleaning up");
+            Ln.w("CONN nego: REJECT sessionId=" + sessionId + " — client executor shut down");
             sessions.remove(sessionId);
             session.shutdown();
         }
@@ -223,15 +307,21 @@ public final class DaemonServer {
         try {
             int sessionId = TcpDesktopConnection.readSessionId(socket);
             int displayId = TcpDesktopConnection.readDisplayId(socket);
+            Ln.i("CONN control: sessionId=" + sessionId + " displayId=" + displayId
+                    + " remote=" + socket.getRemoteSocketAddress());
             ClientSession session = sessions.get(sessionId);
             if (session == null) {
                 Ln.w("Control socket for unknown session " + sessionId);
+                Ln.w("CONN control: REJECT sessionId=" + sessionId + " displayId=" + displayId
+                        + " — unknown session (activeSessions=" + sessions.keySet() + ")");
                 socket.close();
                 return;
             }
             session.onControlSocket(displayId, socket);
+            Ln.i("CONN control: sessionId=" + sessionId + " displayId=" + displayId + " dispatched to session");
         } catch (IOException e) {
             Ln.w("Failed to handle control socket: " + e.getMessage());
+            Ln.w("CONN control: ERROR reading handshake — " + e.getMessage());
             try { socket.close(); } catch (IOException closeEx) {
                 Ln.d("Failed to close control socket after handling error: " + closeEx.getMessage());
             }
@@ -242,15 +332,21 @@ public final class DaemonServer {
         try {
             int sessionId = TcpDesktopConnection.readSessionId(socket);
             int displayId = TcpDesktopConnection.readDisplayId(socket);
+            Ln.i("CONN video: sessionId=" + sessionId + " displayId=" + displayId
+                    + " remote=" + socket.getRemoteSocketAddress());
             ClientSession session = sessions.get(sessionId);
             if (session == null) {
                 Ln.w("Video socket for unknown session " + sessionId);
+                Ln.w("CONN video: REJECT sessionId=" + sessionId + " displayId=" + displayId
+                        + " — unknown session (activeSessions=" + sessions.keySet() + ")");
                 socket.close();
                 return;
             }
             session.onVideoSocket(displayId, socket);
+            Ln.i("CONN video: sessionId=" + sessionId + " displayId=" + displayId + " dispatched to session");
         } catch (IOException e) {
             Ln.w("Failed to handle video socket: " + e.getMessage());
+            Ln.w("CONN video: ERROR reading handshake — " + e.getMessage());
             try { socket.close(); } catch (IOException closeEx) {
                 Ln.d("Failed to close video socket after handling error: " + closeEx.getMessage());
             }
@@ -261,15 +357,21 @@ public final class DaemonServer {
         try {
             int sessionId = TcpDesktopConnection.readSessionId(socket);
             int displayId = TcpDesktopConnection.readDisplayId(socket);
+            Ln.i("CONN audio: sessionId=" + sessionId + " displayId=" + displayId
+                    + " remote=" + socket.getRemoteSocketAddress());
             ClientSession session = sessions.get(sessionId);
             if (session == null) {
                 Ln.w("Audio socket for unknown session " + sessionId);
+                Ln.w("CONN audio: REJECT sessionId=" + sessionId + " displayId=" + displayId
+                        + " — unknown session (activeSessions=" + sessions.keySet() + ")");
                 socket.close();
                 return;
             }
             session.onAudioSocket(displayId, socket);
+            Ln.i("CONN audio: sessionId=" + sessionId + " displayId=" + displayId + " dispatched to session");
         } catch (IOException e) {
             Ln.w("Failed to handle audio socket: " + e.getMessage());
+            Ln.w("CONN audio: ERROR reading handshake — " + e.getMessage());
             try { socket.close(); } catch (IOException closeEx) {
                 Ln.d("Failed to close audio socket after handling error: " + closeEx.getMessage());
             }
