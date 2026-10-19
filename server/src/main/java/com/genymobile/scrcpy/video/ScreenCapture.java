@@ -63,14 +63,24 @@ public class ScreenCapture extends SurfaceCapture {
     private VideoConstraints videoConstraints;
 
     private DisplayInfo displayInfo;
+    /** 编码输出尺寸（= 逻辑尺寸，已包含 display rotation 带来的宽高交换） */
     private Size videoSize;
+    /** GL / 编码器的输入尺寸：虚拟屏 surface 的真实 buffer 尺寸（物理尺寸，不随 rotation 交换） */
+    private Size captureInputSize;
+    /** 输入事件的坐标系尺寸（display 的逻辑尺寸） */
+    private Size eventTargetSize;
+    /** 是否对 daemon 虚拟屏做了旋转补偿（rotation != 0 时开启） */
+    private boolean displayRotationCompensation;
 
     private final DisplayMonitor displayMonitor = new DisplayMonitor();
 
     private IBinder display;
     private VirtualDisplay virtualDisplay;
 
+    /** 输入事件变换：video 坐标 -> display 逻辑坐标 */
     private AffineMatrix transform;
+    /** OpenGL 变换：物理 buffer 坐标 -> video 坐标（比 {@link #transform} 多一层 display rotation） */
+    private AffineMatrix glTransform;
     private OpenGLRunner glRunner;
 
     public ScreenCapture(VirtualDisplayListener vdListener, Options options) {
@@ -126,6 +136,35 @@ public class ScreenCapture extends SurfaceCapture {
 
         transform = filter.getInverseTransform();
         videoSize = filter.getOutputSize().constrain(videoConstraints);
+
+        // 默认：GL/编码输入就是整个显示的逻辑尺寸（没有 GL 时由 videoSize 决定）。
+        captureInputSize = displaySize;
+        eventTargetSize = displaySize;
+        glTransform = transform;
+        displayRotationCompensation = false;
+
+        if (externalDisplayProvider != null && displayRotation != 0) {
+            // daemon 虚拟屏的特殊性：它的 surface buffer 永远是创建时指定的「物理尺寸」，
+            // 而 DisplayInfo.getSize() 返回的是「已旋转的逻辑尺寸」。两者在 rotation 为
+            // 90/270 时互为转置。
+            //
+            // 如果不额外旋转一次，编码器会按逻辑尺寸去采样物理 buffer：
+            //   - 横屏应用（rotation=90）→ 2400x1080 的编码器读 1080x2400 的 buffer，
+            //     实际只有左上角一块内容被拉伸铺满，表现就是「画面被截断/变形」。
+            // 这里照搬上游 NewDisplayCapture 的做法：先用 GL 把物理 buffer 旋转
+            // displayRotation 度，再编码成逻辑尺寸。
+            Size physicalSize = (displayRotation % 2) == 0 ? displaySize : displaySize.rotate();
+            VideoFilter displayFilter = new VideoFilter(physicalSize);
+            displayFilter.addRotation(displayRotation);
+            glTransform = AffineMatrix.multiplyAll(displayFilter.getInverseTransform(), transform);
+            captureInputSize = physicalSize;
+            displayRotationCompensation = true;
+            Ln.i("ScreenCapture: daemon VD rotation=" + displayRotation
+                    + " logical=" + displaySize + " physical=" + physicalSize + " video=" + videoSize
+                    + " -> GL rotation compensation ENABLED");
+        } else if (externalDisplayProvider != null) {
+            Ln.i("ScreenCapture: daemon VD rotation=0 logical=" + displaySize + " video=" + videoSize);
+        }
     }
 
     @Override
@@ -140,21 +179,24 @@ public class ScreenCapture extends SurfaceCapture {
         }
         isDaemonManaged = false;
 
-        if (externalDisplayProvider != null && bindDaemonVirtualDisplay(surface)) {
-            return;
-        }
-
+        // OpenGL 变换必须在绑定 surface 之前建立 —— daemon 路径同样需要它把虚拟屏的
+        // 物理 buffer 旋转成逻辑尺寸。原实现先 bindDaemonVirtualDisplay() 并直接
+        // return，daemon 虚拟屏永远拿不到旋转补偿，横屏应用画面因此被裁切。
         Size inputSize;
-        if (transform != null) {
+        if (glTransform != null) {
             // If there is a filter, it must receive the full display content
-            inputSize = displayInfo.getSize();
+            inputSize = captureInputSize;
             assert glRunner == null;
-            OpenGLFilter glFilter = new AffineOpenGLFilter(transform);
+            OpenGLFilter glFilter = new AffineOpenGLFilter(glTransform);
             glRunner = new OpenGLRunner(glFilter);
             surface = glRunner.start(inputSize, videoSize, surface);
         } else {
             // If there is no filter, the display must be rendered at target video size directly
             inputSize = videoSize;
+        }
+
+        if (externalDisplayProvider != null && bindDaemonVirtualDisplay(surface)) {
+            return;
         }
 
         try {
@@ -202,7 +244,9 @@ public class ScreenCapture extends SurfaceCapture {
                 virtualDisplayId = displayId;
             } else {
                 // The positions are relative to the virtual display, not the original display (so use inputSize, not deviceSize!)
-                positionMapper = PositionMapper.create(videoSize, transform, inputSize);
+                // 注意：这里必须用「逻辑尺寸」而不是 GL 的物理输入尺寸 —— 注入到虚拟屏的
+                // 坐标是 display 的逻辑坐标系（系统会再按 rotation 转到物理坐标系）。
+                positionMapper = PositionMapper.create(videoSize, transform, eventTargetSize);
                 // Always inject touch events into the ORIGINAL display (displayId)
                 // rather than the newly-created mirror virtual display, so that input
                 // reaches the user-created virtual display instead of the capture mirror.
@@ -247,26 +291,23 @@ public class ScreenCapture extends SurfaceCapture {
                 // Match the upstream start() logic exactly (see lines 191-201 above):
                 //  - virtualDisplay != null (daemonVD is set) AND displayId != 0 → use VD's real id + inputSize
                 //  - displayId == 0 → main display path
-                if (displayId == 0) {
-                    Size deviceSize = displayInfo != null ? displayInfo.getSize()
+                // 输入事件的坐标系是 display 的「逻辑尺寸」（系统会再按 rotation 转到
+                // 物理坐标系），所以这里用 eventTargetSize，而不是 GL 的物理输入尺寸。
+                Size targetSize = eventTargetSize;
+                if (targetSize == null) {
+                    targetSize = displayInfo != null ? displayInfo.getSize()
                             : new Size(daemonVD.getDisplay().getWidth(), daemonVD.getDisplay().getHeight());
-                    positionMapper = PositionMapper.create(videoSize, transform, deviceSize);
+                }
+                if (displayId == 0) {
+                    positionMapper = PositionMapper.create(videoSize, transform, targetSize);
                     virtualDisplayId = displayId;
                 } else {
-                    // Positions are relative to the virtual display content area:
-                    // use the encoded target size (inputSize) when a filter is applied,
-                    // otherwise the virtual display's own logical size (displaySize).
-                    Size inputSize;
-                    if (transform != null) {
-                        inputSize = displayInfo != null ? displayInfo.getSize()
-                                : new Size(daemonVD.getDisplay().getWidth(), daemonVD.getDisplay().getHeight());
-                    } else {
-                        inputSize = videoSize;
-                    }
-                    positionMapper = PositionMapper.create(videoSize, transform, inputSize);
+                    positionMapper = PositionMapper.create(videoSize, transform, targetSize);
                     virtualDisplayId = daemonVD.getDisplay().getDisplayId();
                 }
-                Ln.i("ScreenCapture: bindDaemonVirtualDisplay vdListener id=" + virtualDisplayId + " (requested=" + displayId + ")");
+                Ln.i("ScreenCapture: bindDaemonVirtualDisplay vdListener id=" + virtualDisplayId + " (requested=" + displayId
+                        + ", video=" + videoSize + ", input=" + captureInputSize
+                        + ", rotationCompensation=" + displayRotationCompensation + ")");
                 vdListener.onNewVirtualDisplay(virtualDisplayId, positionMapper);
             }
         } catch (Exception e) {
