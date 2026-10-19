@@ -38,7 +38,15 @@ public final class VirtualDisplayRegistry {
     // recovery" guarantee from refs/13 §7. Guarded by activeDisplaysLock.
     private final Map<Integer, Map<Integer, Integer>> displayUsers = new HashMap<>();
 
+    /** Last createVirtualDisplay failure (type + message), surfaced to the client
+     *  so "Failed to create display: FAILED" becomes actionable. */
+    private volatile String lastCreateFailure;
+
     public VirtualDisplayRegistry() {
+    }
+
+    public String getLastCreateFailure() {
+        return lastCreateFailure;
     }
 
     public VirtualDisplay getVirtualDisplay(int displayId) {
@@ -110,7 +118,11 @@ public final class VirtualDisplayRegistry {
             }
             Ln.i("VirtualDisplayRegistry: created virtual display id=" + displayId + " (" + width + "x" + height + "/" + dpi + "), powered=" + powered);
             return displayId;
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // Catch Throwable, not Exception: a NoClassDefFoundError from the
+            // context-based create path is an Error and used to escape this
+            // cleanup entirely, leaking the ImageReader/HandlerThread.
+            lastCreateFailure = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
             Ln.e("VirtualDisplayRegistry: failed to create virtual display", e);
             if (imageReader != null) {
                 try {

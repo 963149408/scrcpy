@@ -252,6 +252,8 @@ public final class Server {
             Ln.i("Device: [" + Build.MANUFACTURER + "] " + Build.BRAND + " " + Build.MODEL + " (Android " + Build.VERSION.RELEASE + ")");
             Ln.i("Starting in daemon mode (root preserved)");
 
+            initFakeContextEagerly();
+
             // DaemonServer owns its TCP server socket lifecycle (init on run,
             // close on shutdown) so this entry point only dispatches.
             new DaemonServer(options, daemonOptions, scrubbed).run();
@@ -298,6 +300,33 @@ public final class Server {
             scrcpy(options);
         } catch (ConfigurationException e) {
             // Do not print stack trace, a user-friendly error-message has already been logged
+        }
+    }
+
+    /**
+     * Build the fake {@code Context} once, on the daemon's main thread (which has
+     * a {@link android.os.Looper}), instead of lazily from a command thread.
+     *
+     * <p>{@code FakeContext.<clinit>} has a nasty failure mode: if it throws once
+     * — because {@code Workarounds.<clinit>} could not construct an
+     * {@code ActivityThread}, or because the thread had no Looper — the class is
+     * marked erroneous for the rest of the process, and every later reference
+     * throws {@code NoClassDefFoundError: com.genymobile.scrcpy.FakeContext}.
+     * The visible symptom then shows up much later and far away, e.g.
+     * "Failed to create display: com.genymobile.scrcpy.FakeContext".
+     *
+     * <p>Initializing here makes the failure loud and immediate (full stack in
+     * the daemon log), and keeps the command threads on the happy path.
+     */
+    private static void initFakeContextEagerly() {
+        try {
+            Workarounds.apply();
+            Object ctx = FakeContext.get();
+            Ln.i("FakeContext ready (class=" + (ctx != null ? ctx.getClass().getName() : "null") + ")");
+        } catch (Throwable t) {
+            Ln.e("FakeContext initialization FAILED — features that need a Context "
+                    + "(DisplayManager(Context), package/app listing) are unavailable in this daemon process; "
+                    + "creating a virtual display will use the context-free route instead", t);
         }
     }
 

@@ -153,7 +153,8 @@ public final class DaemonCommandHandler implements ControlMessageExtension {
             int newDisplayId = registry.createVirtualDisplay(
                     dto.getText(), dto.getWidth(), dto.getHeight(), dto.getDpi(), dto.getFlags(), dto.getDisplayId());
             if (newDisplayId == -1) {
-                throw new RuntimeException("FAILED");
+                String reason = registry.getLastCreateFailure();
+                throw new RuntimeException(reason != null ? "FAILED: " + reason : "FAILED");
             }
             // Make the display persistent by default: acquire a reference for the 
             // daemon itself (-1) and the current session.
@@ -337,12 +338,47 @@ public final class DaemonCommandHandler implements ControlMessageExtension {
     private void sendErrorResponse(ControlMessage msg, Throwable t) {
         if (sender != null) {
             try {
-                String errorMsg = t.getMessage() != null ? t.getMessage() : t.toString();
-                DeviceMessage response = DaemonDeviceMessages.createGenericResponse(payload(msg).getSequence(), -1, -1, errorMsg);
+                // t.getMessage() alone loses the exception type and the throw site.
+                // A bare "com.genymobile.scrcpy.FakeContext" on the client is a
+                // NoClassDefFoundError with no clue where it came from, so send the
+                // type + the first few frames (one line, keeps the frame cheap).
+                DeviceMessage response = DaemonDeviceMessages.createGenericResponse(
+                        payload(msg).getSequence(), -1, -1, describeThrowable(t));
                 sender.send(response);
             } catch (Exception e) {
                 Ln.e("Failed to send error response", e);
             }
         }
+    }
+
+    private static String describeThrowable(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(t.getClass().getName());
+        String msg = t.getMessage();
+        if (msg != null) {
+            sb.append(": ").append(msg);
+        }
+        Throwable cause = t.getCause();
+        for (int depth = 0; cause != null && cause != t && depth < 3; depth++) {
+            sb.append(" <- ").append(cause.getClass().getName());
+            if (cause.getMessage() != null) {
+                sb.append(": ").append(cause.getMessage());
+            }
+            cause = cause.getCause();
+        }
+        StackTraceElement[] frames = t.getStackTrace();
+        int shown = 0;
+        for (StackTraceElement frame : frames) {
+            if (shown == 0) {
+                sb.append(" @ ");
+            } else {
+                sb.append(" | ");
+            }
+            sb.append(frame.toString());
+            if (++shown >= 4) {
+                break;
+            }
+        }
+        return sb.toString();
     }
 }

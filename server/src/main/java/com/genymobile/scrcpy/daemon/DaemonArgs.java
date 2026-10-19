@@ -28,7 +28,8 @@ public final class DaemonArgs {
             int eq = arg.indexOf('=');
             if (eq != -1) {
                 String key = arg.substring(0, eq);
-                if (key.equals("daemon") || key.equals("daemon_port") || key.equals("daemon_bind_address") || key.equals("daemon_secret_token")) {
+                if (key.equals("daemon") || key.equals("daemon_port") || key.equals("daemon_bind_address")
+                        || key.equals("daemon_secret_token") || key.equals("daemon_instance")) {
                     continue;
                 }
             }
@@ -74,7 +75,7 @@ public final class DaemonArgs {
      */
     private static final Set<String> BLOCKED_CONFIGURE_KEYS = Collections.unmodifiableSet(
             new java.util.HashSet<>(Arrays.asList(
-                    "daemon", "daemon_port", "daemon_bind_address", "daemon_secret_token",
+                    "daemon", "daemon_port", "daemon_bind_address", "daemon_secret_token", "daemon_instance",
                     "display_id", "new_display", "scid", "tunnel_forward",
                     "cleanup", "power_on", "power_off_on_close",
                     "list_encoders", "list_displays", "list_cameras",

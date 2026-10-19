@@ -50,6 +50,12 @@ public final class DisplayManager {
     private Method createVirtualDisplayMethod;
     private Method createVirtualDisplayGlobalMethod;
     private Constructor<?> displayManagerCtor;
+    // --- Android 14+ VirtualDisplayConfig route ---
+    // Kept separate from createVirtualDisplayGlobalMethod so probing one route
+    // never masks the other: some ROMs keep only one of the two signatures.
+    private boolean configRouteProbed;
+    private Method configCreateMethod;      // DisplayManagerGlobal.createVirtualDisplay(<VirtualDisplayConfig>, ...)
+    private boolean configCreateTakesPackage; // true when the first param is String packageName
     private Method requestDisplayPowerMethod;
     private boolean requestDisplayPowerUsesInt; // true 表示第二个参数为 int（Display.STATE_*），false 表示 boolean
 
@@ -172,20 +178,55 @@ public final class DisplayManager {
     }
 
     public VirtualDisplay createVirtualDisplay(String name, int width, int height, int displayIdToMirror, Surface surface) throws Exception {
-        Method method = getCreateVirtualDisplayMethod();
-        return (VirtualDisplay) method.invoke(null, name, width, height, displayIdToMirror, surface);
+        try {
+            Method method = getCreateVirtualDisplayMethod();
+            return (VirtualDisplay) method.invoke(null, name, width, height, displayIdToMirror, surface);
+        } catch (Throwable t) {
+            Ln.w("DisplayManager: static mirror createVirtualDisplay failed (" + describe(t) + "), trying config route");
+            int dpi = 240;
+            try {
+                DisplayInfo info = getDisplayInfo(displayIdToMirror);
+                if (info != null && info.getDpi() > 0) {
+                    dpi = info.getDpi();
+                }
+            } catch (Throwable ignored) {
+                // keep default dpi
+            }
+            VirtualDisplay vd = createVirtualDisplayFromConfig(name, width, height, dpi, surface,
+                    android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, displayIdToMirror);
+            if (vd != null) {
+                return vd;
+            }
+            throw new IllegalStateException("mirror createVirtualDisplay failed: " + describe(t));
+        }
     }
 
     public VirtualDisplay createNewVirtualDisplay(String name, int width, int height, int dpi, Surface surface, int flags) throws Exception {
-        // Prefer DisplayManagerGlobal.createVirtualDisplay over constructing a new
-        // DisplayManager(Context): the DisplayManagerGlobal singleton is already
-        // fully initialized, and its createVirtualDisplay method has been stable
-        // across Android versions (with a few overloads). The previous approach of
-        // reflectively constructing DisplayManager with FakeContext is brittle —
-        // FakeContext wraps Workarounds.getSystemContext() and on many Android
-        // builds the shell/root UID cannot satisfy DisplayManager's internal
-        // invariants, causing InvocationTargetException inside
-        // dm.createVirtualDisplay (e.g. "Invalid display manager service handle").
+        StringBuilder failures = new StringBuilder();
+
+        // Route 1 (Android 14+): DisplayManagerGlobal.createVirtualDisplay(VirtualDisplayConfig...)
+        // This is the only route that needs neither a Context nor a looper-backed
+        // callback, so it is tried first. It also survives devices where the
+        // classic 10-arg overload has been removed.
+        try {
+            VirtualDisplay vd = createVirtualDisplayFromConfig(name, width, height, dpi, surface, flags, -1);
+            if (vd != null) {
+                return vd;
+            }
+            failures.append("config: no usable signature; ");
+        } catch (Throwable t) {
+            failures.append("config: ").append(describe(t)).append("; ");
+            Ln.w("DisplayManager: VirtualDisplayConfig route failed: " + describe(t));
+        }
+
+        // Route 2 (Android 10-13): DisplayManagerGlobal.createVirtualDisplay(name-based).
+        // The DisplayManagerGlobal singleton is already fully initialized, so this
+        // avoids constructing DisplayManager(Context) (see route 3) — the previous
+        // approach of reflectively constructing DisplayManager with FakeContext is
+        // brittle: FakeContext wraps Workarounds.getSystemContext() and on many
+        // Android builds the shell/root UID cannot satisfy DisplayManager's internal
+        // invariants, causing InvocationTargetException inside dm.createVirtualDisplay
+        // (e.g. "Invalid display manager service handle").
         if (createVirtualDisplayGlobalMethod == null) {
             // Probe several common overload signatures of DisplayManagerGlobal.
             // The full signature on recent Android is:
@@ -240,23 +281,161 @@ public final class DisplayManager {
                     Ln.i("DisplayManager: created VD via Global (method arity=" + ptypes.length + ")");
                     return vd;
                 }
+                failures.append("global(arity=").append(ptypes.length).append("): returned null; ");
             } catch (java.lang.reflect.InvocationTargetException ite) {
                 Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
-                Ln.w("DisplayManager: Global.createVirtualDisplay failed, will fallback: " + cause);
+                failures.append("global(arity=").append(ptypes.length).append("): ").append(describe(cause)).append("; ");
+                Ln.w("DisplayManager: Global.createVirtualDisplay failed, will fallback: " + describe(cause));
                 // Fall through to fallback path below
             }
+        } else {
+            failures.append("global: no createVirtualDisplay(name, ...) signature; ");
         }
 
-        // Fallback: construct DisplayManager via Context (old path).
+        // Route 3: construct DisplayManager via Context (old path).
         // Cache the constructor to avoid repeated reflective lookup.
         if (displayManagerCtor == null) {
             displayManagerCtor = android.hardware.display.DisplayManager.class.getDeclaredConstructor(Context.class);
             displayManagerCtor.setAccessible(true);
         }
+        Ln.w("DisplayManager: falling back to DisplayManager(Context) path (tried: " + failures + ")");
+        Context context;
+        try {
+            // FakeContext may be unloadable (e.g. a daemon process left over from
+            // a previous APK install: its class loader points at a replaced file,
+            // so classes it never loaded before now fail with
+            // NoClassDefFoundError: com.genymobile.scrcpy.FakeContext).
+            // Report that distinctly instead of letting a bare NCDFE escape.
+            context = FakeContext.get();
+        } catch (Throwable t) {
+            throw new IllegalStateException("cannot create context for DisplayManager (" + describe(t)
+                    + "); tried: " + failures);
+        }
         android.hardware.display.DisplayManager dm =
-                (android.hardware.display.DisplayManager) displayManagerCtor.newInstance(FakeContext.get());
-        Ln.w("DisplayManager: falling back to DisplayManager(Context) path");
+                (android.hardware.display.DisplayManager) displayManagerCtor.newInstance(context);
         return dm.createVirtualDisplay(name, width, height, dpi, surface, flags);
+    }
+
+    /**
+     * Android 14+ route: {@code DisplayManagerGlobal.createVirtualDisplay}
+     * with a {@code VirtualDisplayConfig}.
+     *
+     * <p>Two signatures exist depending on the build:
+     * <pre>
+     *   createVirtualDisplay(String packageName, VirtualDisplayConfig config, Callback cb, Handler handler)
+     *   createVirtualDisplay(VirtualDisplayConfig config, Callback cb, Handler handler)
+     * </pre>
+     *
+     * @return the created display, or {@code null} when no signature matched
+     */
+    private VirtualDisplay createVirtualDisplayFromConfig(String name, int width, int height, int dpi,
+                                                          Surface surface, int flags, int displayIdToMirror) throws Exception {
+        probeConfigRoute();
+        if (configCreateMethod == null) {
+            return null;
+        }
+        Object config = buildVirtualDisplayConfig(name, width, height, dpi, surface, flags, displayIdToMirror);
+        Object[] args = configCreateTakesPackage
+                ? new Object[]{FakeContext.PACKAGE_NAME, config, null, null}
+                : new Object[]{config, null, null};
+        try {
+            VirtualDisplay vd = (VirtualDisplay) configCreateMethod.invoke(manager, args);
+            if (vd != null) {
+                Ln.i("DisplayManager: created VD via VirtualDisplayConfig"
+                        + (configCreateTakesPackage ? " (pkg overload)" : "") + ", " + width + "x" + height + "/" + dpi
+                        + ", flags=0x" + Integer.toHexString(flags));
+            }
+            return vd;
+        } catch (java.lang.reflect.InvocationTargetException ite) {
+            Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
+            throw new IllegalStateException("createVirtualDisplay(config) threw " + describe(cause), cause);
+        }
+    }
+
+    private void probeConfigRoute() {
+        if (configRouteProbed) {
+            return;
+        }
+        configRouteProbed = true;
+        try {
+            Class<?> configClass = Class.forName("android.hardware.display.VirtualDisplayConfig");
+            Class<?> callbackClass = android.hardware.display.VirtualDisplay.Callback.class;
+            Class<?> handlerClass = android.os.Handler.class;
+
+            Method withPkg = null;
+            Method noPkg = null;
+            for (Class<?>[] sig : new Class<?>[][]{
+                    {String.class, configClass, callbackClass, handlerClass},
+                    {String.class, configClass, callbackClass},
+                    {String.class, configClass}}) {
+                try {
+                    withPkg = manager.getClass().getDeclaredMethod("createVirtualDisplay", sig);
+                    withPkg.setAccessible(true);
+                    break;
+                } catch (NoSuchMethodException ignored) {
+                    // try next
+                }
+            }
+            for (Class<?>[] sig : new Class<?>[][]{
+                    {configClass, callbackClass, handlerClass},
+                    {configClass, callbackClass},
+                    {configClass}}) {
+                try {
+                    noPkg = manager.getClass().getDeclaredMethod("createVirtualDisplay", sig);
+                    noPkg.setAccessible(true);
+                    break;
+                } catch (NoSuchMethodException ignored) {
+                    // try next
+                }
+            }
+
+            if (withPkg != null) {
+                configCreateMethod = withPkg;
+                configCreateTakesPackage = true;
+            } else if (noPkg != null) {
+                configCreateMethod = noPkg;
+                configCreateTakesPackage = false;
+            }
+            Ln.i("DisplayManager: VirtualDisplayConfig route "
+                    + (configCreateMethod != null ? "available" : "unavailable")
+                    + (configCreateTakesPackage ? " (pkg overload)" : ""));
+        } catch (Throwable t) {
+            configCreateMethod = null;
+            Ln.w("DisplayManager: VirtualDisplayConfig probing failed: " + describe(t));
+        }
+    }
+
+    private Object buildVirtualDisplayConfig(String name, int width, int height, int dpi,
+                                             Surface surface, int flags, int displayIdToMirror) throws Exception {
+        Class<?> builderClass = Class.forName("android.hardware.display.VirtualDisplayConfig$Builder");
+        Constructor<?> ctor = builderClass.getConstructor(String.class, int.class, int.class, int.class);
+        Object builder = ctor.newInstance(name, width, height, dpi);
+
+        builderClass.getMethod("setFlags", int.class).invoke(builder, flags);
+        if (surface != null) {
+            try {
+                builderClass.getMethod("setSurface", Surface.class).invoke(builder, surface);
+            } catch (NoSuchMethodException e) {
+                // Older builds only accept the surface in the createVirtualDisplay call.
+                throw new IllegalStateException("VirtualDisplayConfig.Builder.setSurface(Surface) not found");
+            }
+        }
+        if (displayIdToMirror >= 0) {
+            try {
+                builderClass.getMethod("setDisplayIdToMirror", int.class).invoke(builder, displayIdToMirror);
+            } catch (NoSuchMethodException ignored) {
+                Ln.w("DisplayManager: setDisplayIdToMirror not available, ignoring mirrorDisplayId=" + displayIdToMirror);
+            }
+        }
+        return builderClass.getMethod("build").invoke(builder);
+    }
+
+    private static String describe(Throwable t) {
+        if (t == null) {
+            return "null";
+        }
+        String msg = t.getMessage();
+        return t.getClass().getSimpleName() + (msg != null ? ": " + msg : "");
     }
 
     private Method getRequestDisplayPowerMethod() throws NoSuchMethodException {
